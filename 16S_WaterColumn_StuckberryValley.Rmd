@@ -1,0 +1,374 @@
+---
+title: "16S_WaterColomn_StuckberryValley"
+output: html_document
+---
+
+#LOAD PACKAGES 
+```{r}
+library(dada2)
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(FSA)
+library(vegan)
+```
+
+
+#DADA2 - FROM RAW READS TO ASVs INFERENCE
+```{r}
+
+#Adapted from the DADA2 Pipeline Tutorial (https://benjjneb.github.io/dada2/tutorial.html)
+
+#Raw 16S rRNA gene sequences for this study are available in the Sequence Read Archive of National Center for Biotechnology Information (SRA-NCBI) under BioProject accession number PRJNA726255
+
+#Set path 
+path <- 'path/to/reads' #Set to the directory containing the fastq files
+list.files(path)
+
+#Make list of FWD and REV files 
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+
+#Inspect read quality profile
+#Forward reads, first two samples
+plotQualityProfile(fnFs[1:2])
+#Reverse reads, first two samples
+plotQualityProfile(fnRs[1:2])
+
+#Filter and trim 
+#Place filtered files in ./filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+#Filtering command 
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(220,195), trimLeft = c(19, 20),maxN=0, maxEE=c(2,2), truncQ=2, compress=TRUE, multithread=FALSE)
+out
+
+#Learn the error rates
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+
+#Dereplication 
+#Make list of dereplicated files
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+#Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+#Sample Inference 
+#Calling the core sample inference algorithm
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+#Inspect data
+dadaFs[[1]]
+dadaRs[[1]]
+
+#Merge paired reads 
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+#Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#Sequence table 
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+#Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+#The merged sequences all fall within the expected range for this V4 amplicon 
+
+#Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+#How much reads weren't chimeras?
+sum(seqtab.nochim)/sum(seqtab)
+
+#Track reads
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+track
+
+#Assign taxonomy 
+#Assign taxonomy up to the genus level
+taxa <- assignTaxonomy(seqtab.nochim, "path/to/database", multithread=FALSE)
+#2nd assignment round for species rank
+taxa <- addSpecies(taxa, "path/to/database")
+#Let's inspect the taxonomic assignments 
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+#Important files for the next steps : taxa and seqtab.nochim
+#Save them 
+write.table(taxa,file="taxa.txt",sep="\t",quote=FALSE)
+write.table(seqtab.nochim,file="seqtab.nochim.txt", sep="\t", quote=FALSE)
+```
+
+#ANALYTICAL PIPELINE
+
+#Import data
+```{r}
+#Set working directory 
+#Import output files from DADA2
+seqtab.nochim <- read.table('seqtab.nochim.txt', header=TRUE)
+taxa <- read.table('taxa.txt', header=TRUE)
+
+#Import metadata file 
+#Create a file with all the limnological parameters of interest for each sample
+metadata <- read.table('metadataSV16S.txt', header=TRUE, row.names=1, na.strings = 'NA')
+```
+
+
+#Construct phyloseq object
+```{r}
+
+ps_stuck <- phyloseq(otu_table(as.matrix(seqtab.nochim), taxa_are_rows=FALSE), sample_data(metadata),tax_table(as.matrix(taxa)))
+ps_stuck
+#30 samples should be listed
+
+#Checking the sequencing depth
+sdt = data.table(as(sample_data(ps_stuck), "data.frame"),
+                 TotalReads = sample_sums(ps_stuck), keep.rownames = TRUE)
+setnames(sdt, "rn", "SampleID")
+pSeqDepth = ggplot(sdt, aes(TotalReads)) + geom_histogram() + ggtitle("Sequencing Depth")
+pSeqDepth
+pSeqDepth + facet_wrap(~Lake)
+#Identify samples with low counts of initial reads 
+#Here: Top0B, Bot75A, Bot75B
+
+#Discard these samples 
+ps_stuck <- subset_samples(ps_stuck,Sample!= "Top0B" & Sample!= "Bot75A" & Sample!= "Bot75B")
+ps_stuck
+#27 samples should be listed 
+```
+
+
+#Alpha diversity 
+```{r}
+#Phyloseq object for Top Lake  
+ps_Top<-subset_samples(ps_stuck, Lake=='Top')
+ps_Top
+
+#Phyloseq object for Y Lake 
+ps_Y<-subset_samples(ps_stuck, Lake=='Y')
+ps_Y
+
+#Phyloseq object for 2FB Lake 
+ps_2FB<-subset_samples(ps_stuck, Lake=='2FB')
+ps_2FB
+
+#Phyloseq object for Bottom Lake 
+ps_Bottom<-subset_samples(ps_stuck, Lake=='Bottom')
+ps_Bottom
+
+#SHANNON DIVERSITY METRIC
+#Shannon diversity plot for Top Lake 
+alpha.shannon.Top <- plot_richness(ps_Top, x="Sample_Depth", measures="Shannon", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(3.2,5.2)
+alpha.shannon.Top
+
+#Shannon diversity plot for Y Lake
+alpha.shannon.Y <- plot_richness(ps_Y, x="Sample_Depth", measures="Shannon", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(3.2,5.2)
+alpha.shannon.Y
+
+#Shannon diversity plot for 2FB Lake 
+alpha.shannon.2FB <- plot_richness(ps_2FB, x="Sample_Depth", measures="Shannon", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(3.2,5.2)
+alpha.shannon.2FB
+
+#Shannon diversity plot for Bottom Lake 
+alpha.shannon.Bottom <- plot_richness(ps_Bottom, x="Sample_Depth", measures="Shannon", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(3.2,5.2)
+alpha.shannon.Bottom
+
+#OBSERVED DIVERSITY METRIC
+#Observed diversity for Top Lake
+alpha.observed.Top <- plot_richness(ps_Top, x="Sample_Depth", measures="Observed", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(250,1250)
+alpha.observed.Top
+
+#Observed diversity for Y Lake
+alpha.observed.Y <- plot_richness(ps_Y, x="Sample_Depth", measures="Observed", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(240,1250)
+alpha.observed.Y
+
+#Observed diversity for 2FB Lake 
+alpha.observed.2FB <- plot_richness(ps_2FB, x="Sample_Depth", measures="Observed", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(250,1250)
+alpha.observed.2FB
+
+#Observed diversity for Bottom Lake  
+alpha.observed.Bottom <- plot_richness(ps_Bottom, x="Sample_Depth", measures="Observed", color="Lake",title=NULL)+geom_point(size=6) + theme(axis.text.x = element_text(angle=90,hjust=1))+xlab('Samples')+ylab('Shannon diversity index')+scale_colour_manual(values=c('#44AA99','#CC6677','#88CCEE','#DDCC77'), breaks=c('Top','Y','2FB','Bottom'))+theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.position='none')+ facet_grid(labeller=element_blank())+ylim(250,1250)
+alpha.observed.Bottom
+
+#STATISTICAL COMPARISONS BETWEEN SURFACE AND BOTTOM WATERS - OBSERVED AND SHANNON DIVERSITY METRIC 
+#For both metrics, a t-test was done to compare surface and bottom water diversity estimates using T.TEST formula (two-sample assuming equal variances) in Microsoft® Excel® (Microsoft 365; v. 2103) for all lakes separately, except for Top Lake for which the test could not be performed due to the single surface sample.
+
+#STATISTICAL COMPARISONS OF GROUPED SAMPLES WITHIN EACH LAKE - SHANNON DIVERSITY METRIC
+#Calculate Shannon estimates 
+est.shannon <- estimate_richness(ps_stuck,split=TRUE,measures=c("Shannon"))
+write.table(est.shannon, "shannon.txt", quote=FALSE, sep="\t")
+
+#In Excel, create a dataframe. For each sample, write its lake name in the first column (named 'site') and its Shannon estimate in the second column (named 'shannon'). Save in .txt. 
+est.mod <- read.table("shannon2.txt",header=TRUE)
+
+#Checking assumption of normality
+shapiro.test(est.mod$shannon)
+#If p-value higher >0.05, continue. 
+#Here : p-value = 0.3657
+
+#Checking assumption of homoscedasticity
+bartlett.test(est.mod$shannon ~ est.mod$site)
+#If p-value <0.05, continue with ANOVA. If not, parametric tests could not be carried out, continue with the nonparametric tests. 
+#Here : p-value = 0.1625, I continue with the nonparametric tests 
+
+#Nonparametric tests
+kruskal.test(est.mod$shannon ~ est.mod$site)
+#If p-value <0.05, one site is significantly different from the others, but we don't know which one. The Dunn's test determines it. 
+#Here, p-value = 0.0009881, I continue with the Dunn's test
+dunnTest(est.mod$shannon ~ est.mod$site,method="bh")
+#If p-value for a pair is <0.05, they are significantly different from each other. 
+#Here : Bottom differed from Y and 2FB, Top from 2FB 
+```
+
+#Bar plot - Major phyla 
+```{r}
+#Checking the taxonomic ranks in the phyloseq object
+rank_names(ps_stuck)
+
+#Sum the ASVs that belong to the same phylum in a new count table
+phyla_counts_tab <- otu_table(tax_glom(ps_stuck, taxrank="Phylum")) 
+
+#Create a vector containing the phyla names, transpose your count table and add the phyla names as row names
+phyla_tax_vec <- as.vector(tax_table(tax_glom(ps_stuck, taxrank="Phylum"))[,2])
+phyla_counts_tab.t <- t(phyla_counts_tab)
+rownames(phyla_counts_tab.t) <- as.vector(phyla_tax_vec)
+
+#Create a table of individual ASV counts per sample, remove low-yielding samples, remove the names of the samples and transpose this table
+count_tab <- tibble::rownames_to_column(seqtab.nochim, var= "SampleID")
+count_tab <- filter(count_tab, SampleID!= "Top0B" & SampleID!= "Bot75A" & SampleID!= "Bot75B")
+count_tab <- tibble::column_to_rownames(count_tab,var="SampleID")
+count_tab.t <- t(count_tab)
+
+#Include ASVs whose taxonomy is not assigned at the phylum level (NAs)
+unclassified_tax_counts <- colSums(count_tab.t) - colSums(phyla_counts_tab.t)
+
+#Combine the different tables to produce a dataframe with ASV abundance by phyla for each sample
+phyla_and_unidentified_counts_tab <- rbind(phyla_counts_tab.t, "Unclassified"=unclassified_tax_counts)
+
+#Convert in relative abundance
+phyla.table <- apply(phyla_and_unidentified_counts_tab,2, function(x) x/sum(x)*100)
+#Keep rows (so phyla) that represent at least 5% of at least one sample = will be classified as Other 
+filt.phyla.table <- data.frame(phyla.table[apply(phyla.table,1,max) >5,])
+filt.prop <- colSums(phyla.table) - colSums(filt.phyla.table)
+filt.phyla.table <- rbind(filt.phyla.table, "Other"=filt.prop)
+
+#Result: a table of relative abundances at the phylum level, by sample
+#To make the figure, transform the row names into a column
+phyla.data <- filt.phyla.table
+phyla.data$Phyla <- row.names(phyla.data)
+
+#Convert table
+phyla.data.g <- gather(phyla.data, Sample, Proportion, -Phyla)
+
+#Separate the dataset by lake  
+phyla.data.g.Top<-filter(phyla.data.g,Sample=='Top0A'|Sample=='Top10A'| Sample=='Top10B'|Sample=='Top20A'|Sample=='Top20B'|Sample=='Top45A'|Sample=='Top45B')
+
+phyla.data.g.Y<-filter(phyla.data.g,Sample=='Y0A'|Sample=='Y0B'|Sample=='Y10A'|Sample=='Y10B'|Sample=='Y25A'|Sample=='Y25B')
+
+phyla.data.g.2FB<-filter(phyla.data.g,Sample=='2FB0A'|Sample=='2FB0B'|Sample=='2FB2A'|Sample=='2FB2B'|Sample=='2FB3A'|Sample=='2FB3B'|Sample=='2FB5A'|Sample=='2FB5B')
+
+phyla.data.g.Bottom<-filter(phyla.data.g,Sample=='Bot0A'|Sample=='Bot0B'|Sample=='Bot3A'|Sample=='Bot3B'|Sample=='Bot4A'|Sample=='Bot4B')
+
+#Create bar plots for each lake
+barplot.Top <- ggplot(phyla.data.g.Top,aes(x=phyla.data.g.Top$Sample,y=phyla.data.g.Top$Proportion,fill=phyla.data.g.Top$Phyla))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, family = 'Arial'),panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank())+xlab('Samples')+ylab('Proportion of ASVs')+labs(fill = "Phyla")
+
+barplot.Y <- ggplot(phyla.data.g.Y,aes(x=phyla.data.g.Y$Sample,y=phyla.data.g.Y$Proportion,fill=phyla.data.g.Y$Phyla))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, family = 'Arial'),panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank())+xlab('Samples')+ylab('Proportion of ASVs')+labs(fill = "Phyla")
+
+barplot.2FB <- ggplot(phyla.data.g.2FB,aes(x=phyla.data.g.2FB$Sample,y=phyla.data.g.2FB$Proportion,fill=phyla.data.g.2FB$Phyla))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, family = 'Arial'),panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank())+xlab('Samples')+ylab('Proportion of ASVs')+labs(fill = "Phyla")
+
+barplot.Bottom <- ggplot(phyla.data.g.Bottom,aes(x=phyla.data.g.Bottom$Sample,y=phyla.data.g.Bottom$Proportion,fill=phyla.data.g.Bottom$Phyla))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5, family = 'Arial'),panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank())+xlab('Samples')+ylab('Proportion of ASVs')+labs(fill = "Phyla")
+
+```
+
+#Microbiome biomarkers - LEfSe 
+```{r}
+#Biomarkers were identified within the Galaxy web application and workflow framework of the Huttenhower laboratory (available to https://huttenhower.sph.harvard.edu/galaxy/)
+#Visit the website for information about the input file and parameters. 
+```
+
+#Beta diveristy - Constrained analysis of principal coordinates (CAP)
+```{r}
+#Convert in relative abundance 
+ps_stuck_rel <- transform_sample_counts(ps_stuck, function(x) x/sum(x)*100)
+
+#Remove rare tax (those with low abundance in the samples)
+ps_stuck_rel_filter <- filter_taxa(ps_stuck_rel,function(x) mean(x)>1e-5, TRUE)
+ps_stuck_rel_filter
+
+#First look at the CAP with all variables of interest (linked to the metadata file)
+cap.ord <- ordinate(ps_stuck_rel_filter, method = "CAP", distance = "jsd", formula = ~CarbonDissolvedOrganic + Chl_conc + dissolvedO2_perc + NitrogenTotal + temp + PhosphorusTotal + Sulfate + conductivity)
+cap.ord
+
+#Check for collinearity using vegan (vif.cca). Start running with all variables and progressively remove some (usually, the ones with the highest scores) until getting scores near or below 10
+cca.ord <- ordinate(ps_stuck_rel_filter, method = "CCA", distance = 'jsd', formula = ~Sulfate + CarbonDissolvedOrganic + dissolvedO2_perc + Chl_conc + PhosphorusTotal)
+vif.cca(cca.ord)
+#Here my scores for the selected variables 
+#Sulfate CarbonDissolvedOrganic       dissolvedO2_perc 
+#2.974622               8.481917               2.084540 
+#Chl_conc        PhosphorusTotal 
+#2.787651              5.610204
+
+#Remake the CAP (constrained ordination, as before), but with only these selected variables
+cap.ord <- ordinate(ps_stuck_rel_filter, method = "CAP", distance ="jsd", formula = ~Sulfate + CarbonDissolvedOrganic + dissolvedO2_perc + Chl_conc + PhosphorusTotal)
+
+#Calculate adjusted R2
+RsquareAdj(cap.ord)
+#R2-adj = 0.8905836
+summary(cap.ord)
+
+#Now, we have identified one potential set of variables that ca be used, but obviously, you could probably find a few other sets that would have scores below 10
+#The VIF analysis is one way of finding which variables to use in your analysis, but it is not the only one. Of course, whatever set of variables you will pick, you should verify that they have low scores or you would have bias because of collinearity
+#Another bias that can happen is one that comes from the order in which the variables are "added" into the equation. The following package will help choose an order, but also does suggestions of "most efficient" variable choice to explain your ordination.
+#The ordiR2step package will check the "best" variables input by running multiple ordinations and comparing their R2.
+
+#Step 1: run your CAP without any variables, this is your "control" ordination with the intercept only, cap.ord0
+#Actually you still run a CCA as CAP is not implemented in those packages
+cap.ord0 <- ordinate(ps_stuck_rel_filter, method = "CCA", distance = "jsd", formula = ~ 1)
+
+#Step 2: run it with all the variables you might want
+cap.ord1 <- ordinate(ps_stuck_rel_filter, method = "CCA", distance = "jsd", formula =~Sulfate + CarbonDissolvedOrganic + dissolvedO2_perc + Chl_conc + PhosphorusTotal)
+
+#Run the test
+ordiR2.forward <- ordiR2step(cap.ord0,cap.ord1)
+ordiR2.forward$anova
+
+#You will have to play a bit between the ordiR2step and the VIF test before you can find a set of variables that are interesting and that don't overflow your figure
+
+#Finally, plot the ordination 
+cap.ord.final.plot <- plot_ordination(ps_stuck_rel_filter, cap.ord, color = "Lake")+geom_point(size=4)
+
+arrow.mat <- scores(cap.ord,display="bp")
+arrow.df <- data.frame(labels=rownames(arrow.mat),arrow.mat)
+arrow.map <- aes(xend=CAP1, yend=CAP2, x=0, y=0, shape=NULL, color=NULL, label=labels)
+label.map <- aes(x=1.3*CAP1, y=1.3*CAP2, shape=NULL, color=NULL, label=labels)
+arrow.head <- arrow(length=unit(0.02,"npc"))
+
+cap.ord.final.env.plot <- cap.ord.final.plot + geom_segment(mapping=arrow.map,size=1.2,data=arrow.df,color="gray",arrow=arrow.head)+geom_text(mapping=label.map,size=3,data=arrow.df,show.legend=FALSE)+geom_point(size=4) +theme(panel.background=element_rect(fill="white",colour="grey"),panel.grid = element_blank(),legend.key = element_rect(fill = "white"),axis.text=element_text(size=14), axis.title = element_text(size=14), legend.text=element_text(size=14), legend.title = element_text(size=14))+ scale_colour_manual(values=c('#88CCEE','#DDCC77','#44AA99','#CC6677'))
+
+#PERMUTATIONAL ANALYSIS OF VARIANCE 
+#Does the variable ''Lake'' significantly explained the community composition variance?
+distance.matrix <- phyloseq::distance(ps_stuck_rel_filter,method='jsd')
+distance.df <- data.frame(sample_data(ps_stuck_rel_filter))
+adonis(distance.matrix ~ Lake,data=distance.df)
+#If p-value <0.05, yes
+# Here : p-value < 0.001 and R2=0.89857
+
+#WITHIN-GROUP DISPERSION HOMOGENEITY
+betadisp <- betadisper(distance.matrix,distance.df$Lake)
+permutest(betadisp)
+#Here : p-value = 0.252, intra-lake dispersion is not significative.
+```
+
